@@ -20,33 +20,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Exactly what the PR runs, plus the client's measured peak.
-          - name: cap-8g
-            limit: 8g
-            client_gc: "no"
-            server_gc: "no"
-          # The client's natural peak. The server collects every second so it
-          # stays small and cannot exhaust the runner's RAM.
-          - name: uncapped
+          # Control: the same client against the autobahn echo server.
+          - name: published-echo-uncapped
+            image: published
+            server: echo
             limit: none
             client_gc: "no"
             server_gc: "yes"
-          # As above, with the client also collecting every second.
-          - name: uncapped-gc
+          # The same client against aiohttp's own autobahn test server.
+          - name: published-aiohttp-uncapped
+            image: published
+            server: aiohttp
+            limit: none
+            client_gc: "no"
+            server_gc: "no"
+          - name: published-aiohttp-cap-8g
+            image: published
+            server: aiohttp
+            limit: 8g
+            client_gc: "no"
+            server_gc: "no"
+          - name: published-aiohttp-uncapped-gc
+            image: published
+            server: aiohttp
             limit: none
             client_gc: "yes"
-            server_gc: "yes"
-          # The published image, as pulled by downstream CI (e.g. aiohttp).
-          - name: published-cap-8g
-            image: published
-            limit: 8g
-            client_gc: "no"
             server_gc: "no"
-          - name: published-uncapped
-            image: published
-            limit: none
-            client_gc: "no"
-            server_gc: "yes"
 
     steps:
       - name: Checkout code
@@ -96,6 +95,14 @@ jobs:
         if: matrix.image != 'published'
         run: just docker-build
 
+      - name: Install aiohttp
+        if: matrix.server == 'aiohttp'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aiohttp"
+          "$RUNNER_TEMP/aiohttp/bin/pip" install --quiet 'aiohttp==3.14.5'
+          "$RUNNER_TEMP/aiohttp/bin/python" -c "import sys, aiohttp; print(sys.version, aiohttp.__version__)"
+          echo "AIOHTTP_PYTHON=$RUNNER_TEMP/aiohttp/bin/python" >> $GITHUB_ENV
+
       - name: Runner and image details
         run: |
           echo "kernel: $(uname -r)  cpus: $(nproc)"
@@ -108,6 +115,8 @@ jobs:
             "import sys; print(sys.version); print('jit: %s' % sys.pypy_translation_info['translation.jit'])"
 
       - name: Run fuzzingclient (${{ matrix.name }})
+        env:
+          SERVER: ${{ matrix.server || 'echo' }}
         run: |
           test/fuzzingclient_memory/measure.sh measure \
             "${{ matrix.limit }}" "${{ matrix.client_gc }}" "${{ matrix.server_gc }}"
@@ -121,4 +130,5 @@ jobs:
             measure/summary.txt
             measure/samples.csv
             measure/client.log
+            measure/server.log
           if-no-files-found: ignore

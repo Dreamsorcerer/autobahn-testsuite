@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run the echo server and the full fuzzingclient in Docker, sampling both
-# containers' memory (RAM + swap) every 2s from their cgroups.
+# Run a WebSocket server and the full fuzzingclient (in Docker), sampling the
+# memory (RAM + swap) of both every 2s.
 #
 # Usage: measure.sh <outdir> <client-memory-limit|none> <client-force-gc: yes|no> <server-force-gc: yes|no>
 # Env:   IMAGE (required), PYTHON_BIN (default: python, inside the image),
-#        SPEC (default: fuzzingclient.json, in this directory)
+#        SPEC (default: fuzzingclient.json, in this directory),
+#        SERVER (echo: autobahn echo server in the image [default];
+#                aiohttp: aiohttp_server.py on the host, run by $AIOHTTP_PYTHON)
 set -euo pipefail
 
 OUT=$1
@@ -14,6 +16,7 @@ SERVER_GC=$4
 : "${IMAGE:?IMAGE must be set}"
 PYTHON_BIN=${PYTHON_BIN:-python}
 SPEC=${SPEC:-fuzzingclient.json}
+SERVER=${SERVER:-echo}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$OUT/reports"
@@ -31,9 +34,16 @@ fi
 
 docker rm -f echo-server fuzzingclient >/dev/null 2>&1 || true
 
-docker run -d --pull never --name echo-server --network host \
-  "${server_gc_args[@]}" -v "$HERE:/test:ro" \
-  "$IMAGE" "$PYTHON_BIN" /test/echo_server.py ws://127.0.0.1:9001 >/dev/null
+server_pid=
+if [ "$SERVER" = aiohttp ]; then
+  : "${AIOHTTP_PYTHON:?AIOHTTP_PYTHON must be set for SERVER=aiohttp}"
+  "$AIOHTTP_PYTHON" "$HERE/aiohttp_server.py" > "$OUT/server.log" 2>&1 &
+  server_pid=$!
+else
+  docker run -d --pull never --name echo-server --network host \
+    "${server_gc_args[@]}" -v "$HERE:/test:ro" \
+    "$IMAGE" "$PYTHON_BIN" /test/echo_server.py ws://127.0.0.1:9001 >/dev/null
+fi
 for _ in $(seq 30); do
   (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null && break
   sleep 1
@@ -76,8 +86,13 @@ kpeak() {
   fi
 }
 
+# A host process's current RSS + swap, and its peak RSS (+ current swap), in bytes.
+proc_usage() { awk '/^VmRSS:|^VmSwap:/ { t += $2 } END { print t * 1024 }' "/proc/$1/status"; }
+proc_peak() { awk '/^VmHWM:|^VmSwap:/ { t += $2 } END { print t * 1024 }' "/proc/$1/status"; }
+
 client_cg=$(cgdir fuzzingclient)
-server_cg=$(cgdir echo-server)
+server_cg=
+[ -z "$server_pid" ] && server_cg=$(cgdir echo-server)
 if [ -f "$client_cg/memory.max" ]; then
   echo "client cgroup: memory.max=$(cat "$client_cg/memory.max") memory.swap.max=$(cat "$client_cg/memory.swap.max")"
 else
@@ -92,24 +107,25 @@ client_kpeak=0
 server_kpeak=0
 while [ "$(docker inspect -f '{{.State.Running}}' fuzzingclient)" = true ]; do
   c=$(usage "$client_cg" 2>/dev/null || echo 0)
-  s=$(usage "$server_cg" 2>/dev/null || echo 0)
+  if [ -n "$server_pid" ]; then s=$(proc_usage "$server_pid" 2>/dev/null || echo 0); else s=$(usage "$server_cg" 2>/dev/null || echo 0); fi
   [ "$c" -gt "$client_peak" ] && client_peak=$c
   [ "$s" -gt "$server_peak" ] && server_peak=$s
   kc=$(kpeak "$client_cg" 2>/dev/null || echo 0); [ "$kc" -gt "$client_kpeak" ] && client_kpeak=$kc
-  ks=$(kpeak "$server_cg" 2>/dev/null || echo 0); [ "$ks" -gt "$server_kpeak" ] && server_kpeak=$ks
+  if [ -n "$server_pid" ]; then ks=$(proc_peak "$server_pid" 2>/dev/null || echo 0); else ks=$(kpeak "$server_cg" 2>/dev/null || echo 0); fi
+  [ "$ks" -gt "$server_kpeak" ] && server_kpeak=$ks
   case_id=$(docker logs --tail 1 fuzzingclient 2>&1 | sed -n 's/.*Running test case ID \([0-9.]*\).*/\1/p')
   echo "$(( $(date +%s) - start )),${case_id:--},$c,$s" >> "$OUT/samples.csv"
   sleep 2
 done
 
 docker logs fuzzingclient > "$OUT/client.log" 2>&1
-docker logs echo-server > "$OUT/server.log" 2>&1
+[ -z "$server_pid" ] && docker logs echo-server > "$OUT/server.log" 2>&1
 exit_code=$(docker inspect -f '{{.State.ExitCode}}' fuzzingclient)
 oom=$(docker inspect -f '{{.State.OOMKilled}}' fuzzingclient)
 last_case=$(grep 'Running test case ID' "$OUT/client.log" | tail -1 | sed 's/.*ID \([0-9.]*\).*/\1/')
 
 {
-  echo "client limit=$LIMIT client force_gc=$FORCE_GC server force_gc=$SERVER_GC"
+  echo "server=$SERVER client limit=$LIMIT client force_gc=$FORCE_GC server force_gc=$SERVER_GC"
   echo "client: exit=$exit_code oom_killed=$oom last_case=$last_case elapsed=$(( $(date +%s) - start ))s"
   echo "client peak: $(( client_kpeak / 1048576 )) MiB (kernel), $(( client_peak / 1048576 )) MiB (sampled)"
   echo "server peak: $(( server_kpeak / 1048576 )) MiB (kernel), $(( server_peak / 1048576 )) MiB (sampled)"
@@ -119,4 +135,8 @@ last_case=$(grep 'Running test case ID' "$OUT/client.log" | tail -1 | sed 's/.*I
 } | tee "$OUT/summary.txt"
 
 docker rm -f echo-server fuzzingclient >/dev/null 2>&1 || true
+if [ -n "$server_pid" ]; then
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+fi
 exit "$exit_code"

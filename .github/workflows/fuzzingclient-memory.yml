@@ -20,31 +20,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Control: the same client against the autobahn echo server.
-          - name: published-echo-uncapped
-            image: published
-            server: echo
-            limit: none
-            client_gc: "no"
-            server_gc: "yes"
-          # The same client against aiohttp's own autobahn test server.
-          - name: published-aiohttp-uncapped
+          # Control: PyPy picks its nursery from this runner's CPU cache size.
+          - name: aiohttp-default-cap-8g
             image: published
             server: aiohttp
-            limit: none
-            client_gc: "no"
-            server_gc: "no"
-          - name: published-aiohttp-cap-8g
-            image: published
-            server: aiohttp
+            nursery: ""
             limit: 8g
             client_gc: "no"
             server_gc: "no"
-          - name: published-aiohttp-uncapped-gc
+          # A 130 MB nursery, as PyPy picks on a CPU reporting a 260 MB cache.
+          - name: aiohttp-nursery130m-cap-8g
             image: published
             server: aiohttp
+            nursery: 130MB
+            limit: 8g
+            client_gc: "no"
+            server_gc: "no"
+          - name: aiohttp-nursery130m-uncapped
+            image: published
+            server: aiohttp
+            nursery: 130MB
             limit: none
-            client_gc: "yes"
+            client_gc: "no"
+            server_gc: "no"
+          # Candidate fix: pin a small nursery whatever the CPU reports.
+          - name: aiohttp-nursery4m-cap-8g
+            image: published
+            server: aiohttp
+            nursery: 4MB
+            limit: 8g
+            client_gc: "no"
             server_gc: "no"
 
     steps:
@@ -113,10 +118,16 @@ jobs:
           docker image inspect "$IMAGE" --format 'image: {{.Id}} created={{.Created}} digests={{.RepoDigests}}'
           docker run --rm --pull never "$IMAGE" python -c \
             "import sys; print(sys.version); print('jit: %s' % sys.pypy_translation_info['translation.jit'])"
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 'cache size' /proc/cpuinfo
+          # What PyPy's GC detects and picks on this runner (default settings).
+          docker run --rm --pull never -e PYPYLOG=gc-hardware,gc-set-nursery-size:- "$IMAGE" python -c pass 2>&1 \
+            | grep -E '^(L2cache|nursery size|memtotal)'
 
       - name: Run fuzzingclient (${{ matrix.name }})
         env:
           SERVER: ${{ matrix.server || 'echo' }}
+          CLIENT_NURSERY: ${{ matrix.nursery }}
         run: |
           test/fuzzingclient_memory/measure.sh measure \
             "${{ matrix.limit }}" "${{ matrix.client_gc }}" "${{ matrix.server_gc }}"

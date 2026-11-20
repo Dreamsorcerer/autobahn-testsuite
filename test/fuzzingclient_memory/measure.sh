@@ -6,7 +6,8 @@
 # Env:   IMAGE (required), PYTHON_BIN (default: python, inside the image),
 #        SPEC (default: fuzzingclient.json, in this directory),
 #        SERVER (echo: autobahn echo server in the image [default];
-#                aiohttp: aiohttp_server.py on the host, run by $AIOHTTP_PYTHON)
+#                aiohttp: aiohttp_server.py on the host, run by $AIOHTTP_PYTHON),
+#        CLIENT_NURSERY (optional PYPY_GC_NURSERY for the client, e.g. 4MB)
 set -euo pipefail
 
 OUT=$1
@@ -31,6 +32,8 @@ limit_args=()
 if [ "$LIMIT" != none ]; then
   limit_args=(--memory="$LIMIT" --memory-swap="$LIMIT")
 fi
+nursery_args=()
+[ -n "${CLIENT_NURSERY:-}" ] && nursery_args=(-e PYPY_GC_NURSERY="$CLIENT_NURSERY")
 
 docker rm -f echo-server fuzzingclient >/dev/null 2>&1 || true
 
@@ -50,7 +53,7 @@ for _ in $(seq 30); do
 done
 
 docker run -d --pull never --name fuzzingclient --network host \
-  "${limit_args[@]}" "${gc_args[@]}" -e PYTHONUNBUFFERED=1 \
+  "${limit_args[@]}" "${gc_args[@]}" "${nursery_args[@]}" -e PYTHONUNBUFFERED=1 \
   -v "$HERE:/config:ro" -v "$OUT/reports:/reports" \
   "$IMAGE" wstest --mode fuzzingclient --spec "/config/$SPEC" >/dev/null
 
@@ -125,7 +128,7 @@ oom=$(docker inspect -f '{{.State.OOMKilled}}' fuzzingclient)
 last_case=$(grep 'Running test case ID' "$OUT/client.log" | tail -1 | sed 's/.*ID \([0-9.]*\).*/\1/')
 
 {
-  echo "server=$SERVER client limit=$LIMIT client force_gc=$FORCE_GC server force_gc=$SERVER_GC"
+  echo "server=$SERVER client limit=$LIMIT client nursery=${CLIENT_NURSERY:-default} client force_gc=$FORCE_GC server force_gc=$SERVER_GC"
   echo "client: exit=$exit_code oom_killed=$oom last_case=$last_case elapsed=$(( $(date +%s) - start ))s"
   echo "client peak: $(( client_kpeak / 1048576 )) MiB (kernel), $(( client_peak / 1048576 )) MiB (sampled)"
   echo "server peak: $(( server_kpeak / 1048576 )) MiB (kernel), $(( server_peak / 1048576 )) MiB (sampled)"

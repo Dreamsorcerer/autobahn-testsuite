@@ -2,10 +2,7 @@ name: fuzzingclient-memory
 
 on:
   push:
-    branches: [master]
-    tags: ["v*"]
-  pull_request:
-    branches: [master]
+    branches: [bot-ci-memory-experiments]
   workflow_dispatch:
 
 env:
@@ -15,8 +12,29 @@ env:
 
 jobs:
   fuzzingclient-memory:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exactly what the PR runs, plus the client's measured peak.
+          - name: cap-8g
+            limit: 8g
+            client_gc: "no"
+            server_gc: "no"
+          # The client's natural peak. The server collects every second so it
+          # stays small and cannot exhaust the runner's RAM.
+          - name: uncapped
+            limit: none
+            client_gc: "no"
+            server_gc: "yes"
+          # As above, with the client also collecting every second.
+          - name: uncapped-gc
+            limit: none
+            client_gc: "yes"
+            server_gc: "yes"
 
     steps:
       - name: Checkout code
@@ -58,31 +76,28 @@ jobs:
       - name: Build Docker image from this checkout
         run: just docker-build
 
-      - name: Start echo server
+      - name: Runner and image details
         run: |
-          docker run -d --pull never --name echo-server --network host \
-            -v "$PWD/test/fuzzingclient_memory:/test:ro" \
-            "$IMAGE" python /test/echo_server.py ws://127.0.0.1:9001
-          for i in $(seq 30); do
-            (echo > /dev/tcp/127.0.0.1/9001) 2>/dev/null && exit 0
-            sleep 1
-          done
-          docker logs echo-server
-          exit 1
+          echo "kernel: $(uname -r)  cpus: $(nproc)"
+          free -m
+          swapon --show || true
+          echo "cgroup fs: $(stat -fc %T /sys/fs/cgroup)"
+          docker info --format 'docker cgroup: v{{.CgroupVersion}} driver={{.CgroupDriver}}'
+          docker run --rm --pull never "$IMAGE" python -c \
+            "import sys; print(sys.version); print('jit: %s' % sys.pypy_translation_info['translation.jit'])"
 
-      - name: Run fuzzingclient (all cases, 8 GiB memory limit)
+      - name: Run fuzzingclient (${{ matrix.name }})
         run: |
-          mkdir -p reports
-          docker run --pull never --name fuzzingclient --network host \
-            --memory=8g --memory-swap=8g \
-            -e PYTHONUNBUFFERED=1 \
-            -v "$PWD/test/fuzzingclient_memory:/config:ro" \
-            -v "$PWD/reports:/reports" \
-            "$IMAGE" wstest --mode fuzzingclient --spec /config/fuzzingclient.json
+          test/fuzzingclient_memory/measure.sh measure \
+            "${{ matrix.limit }}" "${{ matrix.client_gc }}" "${{ matrix.server_gc }}"
 
-      - name: Container state
+      - name: Upload measurements
         if: always()
-        run: |
-          docker inspect fuzzingclient \
-            --format 'fuzzingclient: OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' || true
-          docker stats --no-stream echo-server || true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzzingclient-memory-${{ matrix.name }}
+          path: |
+            measure/summary.txt
+            measure/samples.csv
+            measure/client.log
+          if-no-files-found: ignore
